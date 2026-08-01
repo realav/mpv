@@ -190,7 +190,6 @@ class Window: NSWindow, NSWindowDelegate {
 
     func windowDidEnterFullScreen(_ notification: Notification) {
         isInFullscreen = true
-        hasShadow = false
         option.setOption(fullscreen: isInFullscreen)
         common.updateCursorVisibility()
         endAnimation(frame)
@@ -200,7 +199,6 @@ class Window: NSWindow, NSWindowDelegate {
     func windowDidExitFullScreen(_ notification: Notification) {
         guard let tScreen = targetScreen else { return }
         isInFullscreen = false
-        hasShadow = true
         option.setOption(fullscreen: isInFullscreen)
         endAnimation(calculateWindowPosition(for: tScreen, withoutBounds: targetScreen == screen))
         common.view?.layerContentsPlacement = .scaleProportionallyToFit
@@ -246,7 +244,6 @@ class Window: NSWindow, NSWindowDelegate {
             styleMask.insert(.fullScreen)
         }
 
-        hasShadow = false
         NSApp.presentationOptions = [.autoHideMenuBar, .autoHideDock]
         setFrame(targetFrame, display: true)
         endAnimation()
@@ -266,7 +263,6 @@ class Window: NSWindow, NSWindowDelegate {
             styleMask.remove(.fullScreen)
         }
 
-        hasShadow = true
         let newFrame = calculateWindowPosition(for: tScreen, withoutBounds: targetScreen == screen)
         NSApp.presentationOptions = []
         setFrame(newFrame, display: true)
