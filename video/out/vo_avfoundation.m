@@ -48,8 +48,12 @@ struct priv {
     int64_t osd_change_id;
     bool osd_empty;
     int64_t osd_last_ns;
-    CVPixelBufferPoolRef osd_pool;
-    int osd_pool_w, osd_pool_h;
+    // ping-pong IOSurface buffers; each remembers which rows it dirtied so
+    // the next reuse clears only those instead of the whole 4K surface
+    CVPixelBufferRef osd_pb[2];
+    int osd_pb_dirty[2][2];
+    int osd_pb_idx;
+    int osd_pb_w, osd_pb_h;
 };
 
 // Attach colorimetry from mpv's params if the decoder didn't tag the buffer;
@@ -96,19 +100,21 @@ static bool blend_part(uint32_t *buf, int bx, int by, int W, int H,
     if (dw <= 0 || dh <= 0)
         return false;
 
+    bool scaled = dw != sb->w || dh != sb->h;
     bool visible = false;
     for (int y = 0; y < dh; y++) {
         int dy = sb->y + y - by;
         if (dy < 0 || dy >= H)
             continue;
         const uint32_t *src_row =
-            (const uint32_t *)((const uint8_t *)sb->bitmap + (int64_t)(y * sb->h / dh) * sb->stride);
+            (const uint32_t *)((const uint8_t *)sb->bitmap +
+                               (int64_t)(scaled ? y * sb->h / dh : y) * sb->stride);
         uint32_t *dst_row = buf + (int64_t)dy * W;
         for (int x = 0; x < dw; x++) {
             int dx = sb->x + x - bx;
             if (dx < 0 || dx >= W)
                 continue;
-            uint32_t s = src_row[x * sb->w / dw];
+            uint32_t s = src_row[scaled ? x * sb->w / dw : x];
             if (!s)
                 continue;
             visible = true;
@@ -139,30 +145,30 @@ static void clear_osd(struct priv *p)
 
 // IOSurface-backed BGRA buffers: CoreAnimation maps them zero-copy, so even
 // per-tick OSC updates never cost the main thread a full-window image copy
-static bool ensure_osd_pool(struct priv *p, int W, int H)
+static bool ensure_osd_buffers(struct priv *p, int W, int H)
 {
-    if (p->osd_pool && p->osd_pool_w == W && p->osd_pool_h == H)
+    if (p->osd_pb[0] && p->osd_pb_w == W && p->osd_pb_h == H)
         return true;
-    if (p->osd_pool) {
-        CVPixelBufferPoolRelease(p->osd_pool);
-        p->osd_pool = NULL;
+    for (int i = 0; i < 2; i++) {
+        if (p->osd_pb[i]) {
+            CVPixelBufferRelease(p->osd_pb[i]);
+            p->osd_pb[i] = NULL;
+        }
     }
 
     NSDictionary *attrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-        (id)kCVPixelBufferWidthKey: @(W),
-        (id)kCVPixelBufferHeightKey: @(H),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
-    NSDictionary *pool_attrs = @{
-        (id)kCVPixelBufferPoolMinimumBufferCountKey: @3,
-    };
-    if (CVPixelBufferPoolCreate(kCFAllocatorDefault,
-            (__bridge CFDictionaryRef)pool_attrs,
-            (__bridge CFDictionaryRef)attrs, &p->osd_pool) != kCVReturnSuccess)
-        return false;
-    p->osd_pool_w = W;
-    p->osd_pool_h = H;
+    for (int i = 0; i < 2; i++) {
+        if (CVPixelBufferCreate(kCFAllocatorDefault, W, H,
+                kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs,
+                &p->osd_pb[i]) != kCVReturnSuccess)
+            return false;
+        p->osd_pb_dirty[i][0] = 0;
+        p->osd_pb_dirty[i][1] = H;  // fresh memory: clear everything once
+    }
+    p->osd_pb_w = W;
+    p->osd_pb_h = H;
     return true;
 }
 
@@ -171,9 +177,9 @@ static void update_osd(struct vo *vo)
     struct priv *p = vo->priv;
 
     // scripted OSCs animate every tick; rendering+packing a 4K ASS overlay
-    // per video frame costs a full core, so cap OSD updates at 20 Hz
+    // per video frame costs a full core, so cap OSD updates at 30 Hz
     int64_t now = mp_time_ns();
-    if (now - p->osd_last_ns < MP_TIME_MS_TO_NS(50))
+    if (now - p->osd_last_ns < MP_TIME_MS_TO_NS(33))
         return;
     p->osd_last_ns = now;
 
@@ -209,31 +215,40 @@ static void update_osd(struct vo *vo)
     p->osd_change_id = list->change_id;
     p->osd_res = res;
 
-    int num_parts = 0;
-    for (int i = 0; i < list->num_items; i++)
-        num_parts += list->items[i]->num_parts;
-    if (!num_parts) {
+    // row range covered by the current parts (for the next reuse's clear)
+    int cur_y0 = H, cur_y1 = 0, num_parts = 0;
+    for (int i = 0; i < list->num_items; i++) {
+        struct sub_bitmaps *imgs = list->items[i];
+        for (int j = 0; j < imgs->num_parts; j++) {
+            struct sub_bitmap *sb = &imgs->parts[j];
+            int dh = sb->dh ? sb->dh : sb->h;
+            cur_y0 = MPMIN(cur_y0, MPMAX(sb->y, 0));
+            cur_y1 = MPMAX(cur_y1, MPMIN(sb->y + dh, H));
+            num_parts++;
+        }
+    }
+    if (!num_parts || cur_y1 <= cur_y0) {
         clear_osd(p);
         goto done;
     }
 
-    if (!ensure_osd_pool(p, W, H)) {
+    if (!ensure_osd_buffers(p, W, H)) {
         clear_osd(p);
         goto done;
     }
 
-    CVPixelBufferRef pb = NULL;
-    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, p->osd_pool,
-                                           &pb) != kCVReturnSuccess || !pb)
-    {
-        clear_osd(p);
-        goto done;
-    }
+    int idx = p->osd_pb_idx ^= 1;
+    CVPixelBufferRef pb = p->osd_pb[idx];
 
     CVPixelBufferLockBaseAddress(pb, 0);
     uint32_t *buf = CVPixelBufferGetBaseAddress(pb);
-    int stride32 = CVPixelBufferGetBytesPerRow(pb) / 4;
-    memset(buf, 0, CVPixelBufferGetBytesPerRow(pb) * H);
+    size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+    int stride32 = bpr / 4;
+
+    // clear only the rows this buffer dirtied last time it was displayed
+    int c0 = p->osd_pb_dirty[idx][0], c1 = p->osd_pb_dirty[idx][1];
+    if (c1 > c0)
+        memset((uint8_t *)buf + (size_t)c0 * bpr, 0, (size_t)(c1 - c0) * bpr);
 
     bool visible = false;
     for (int i = 0; i < list->num_items; i++) {
@@ -241,15 +256,17 @@ static void update_osd(struct vo *vo)
         for (int j = 0; j < imgs->num_parts; j++)
             visible |= blend_part(buf, 0, 0, stride32, H, &imgs->parts[j]);
     }
+    p->osd_pb_dirty[idx][0] = cur_y0;
+    p->osd_pb_dirty[idx][1] = cur_y1;
     CVPixelBufferUnlockBaseAddress(pb, 0);
 
     // e.g. a faded-out OSC still submits fully transparent bitmaps every tick
     if (!visible) {
-        CVPixelBufferRelease(pb);
         clear_osd(p);
         goto done;
     }
 
+    CVPixelBufferRetain(pb);
     [p->mac setOsd:(void *)pb];  // transfers the +1 retain
     p->osd_empty = false;
 
@@ -409,8 +426,10 @@ static void uninit(struct vo *vo)
     mp_image_unrefp(&p->next_image);
     if (p->format_desc)
         CFRelease(p->format_desc);
-    if (p->osd_pool)
-        CVPixelBufferPoolRelease(p->osd_pool);
+    for (int i = 0; i < 2; i++) {
+        if (p->osd_pb[i])
+            CVPixelBufferRelease(p->osd_pb[i]);
+    }
 
     hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
     av_buffer_unref(&p->hwctx.av_device_ref);
