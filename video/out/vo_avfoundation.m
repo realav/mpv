@@ -301,6 +301,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
                           params->color.transfer == PL_COLOR_TRC_HLG);
     [p->mac setWantsEdr:hdr];
 
+    MP_VERBOSE(vo, "reconfig flush (hdr=%d)\n", hdr);
     [p->mac flush];
     if (p->format_desc) {
         CFRelease(p->format_desc);

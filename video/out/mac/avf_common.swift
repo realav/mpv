@@ -207,6 +207,9 @@ class AVFCommon: Common {
                         (layer.error?.localizedDescription ?? "unknown error"))
             layer.flush()
         }
+        if !layer.isReadyForMoreMediaData {
+            log.verbose("enqueue while layer not ready")
+        }
         layer.enqueue(sampleBuffer)
     }
 
