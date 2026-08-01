@@ -297,6 +297,10 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     struct priv *p = vo->priv;
 
+    bool hdr = params && (params->color.transfer == PL_COLOR_TRC_PQ ||
+                          params->color.transfer == PL_COLOR_TRC_HLG);
+    [p->mac setWantsEdr:hdr];
+
     [p->mac flush];
     if (p->format_desc) {
         CFRelease(p->format_desc);

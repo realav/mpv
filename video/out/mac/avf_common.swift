@@ -26,6 +26,7 @@ class AVFCommon: Common {
     var rootLayer: CALayer?
     var osdLayer: CALayer?
     var osdPixelBuffer: CVPixelBuffer?
+    var edrWarmup: CAMetalLayer?
 
     // display-link vsync pacing, same as MacCommon: flip blocks until the
     // next display refresh so mpv's display-sync sees real vsync cadence
@@ -211,6 +212,24 @@ class AVFCommon: Common {
 
     @objc func flush() {
         layer?.flushAndRemoveImage()
+    }
+
+    // ask macOS to switch the display into EDR mode while the window is still
+    // black, so the visible brightness remap doesn't flash over the video
+    @objc func setWantsEdr(_ wants: Bool) {
+        DispatchQueue.main.async {
+            if wants, self.edrWarmup == nil, let root = self.rootLayer {
+                let warmup = CAMetalLayer()
+                warmup.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+                warmup.wantsExtendedDynamicRangeContent = true
+                warmup.isOpaque = false
+                root.insertSublayer(warmup, at: 0)
+                self.edrWarmup = warmup
+            } else if !wants, let warmup = self.edrWarmup {
+                warmup.removeFromSuperlayer()
+                self.edrWarmup = nil
+            }
+        }
     }
 
     override func windowDidResize() {
