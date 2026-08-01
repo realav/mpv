@@ -22,6 +22,7 @@
  */
 
 #import <AVFoundation/AVFoundation.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 
@@ -29,6 +30,7 @@
 
 #include "common/common.h"
 #include "osdep/mac/swift.h"
+#include "sub/osd.h"
 #include "video/hwdec.h"
 #include "video/mp_image.h"
 #include "vo.h"
@@ -38,6 +40,12 @@ struct priv {
     struct mp_hwdec_ctx hwctx;
     struct mp_image *next_image;
     CMVideoFormatDescriptionRef format_desc;
+
+    // OSD/subtitle overlay state
+    double osd_pts;
+    struct mp_osd_res osd_res;
+    int64_t osd_change_id;
+    uint32_t *osd_buf;
 };
 
 // Attach colorimetry from mpv's params if the decoder didn't tag the buffer;
@@ -71,6 +79,119 @@ static void set_color_attachments(struct vo *vo, CVPixelBufferRef pixbuf)
             CVBufferSetAttachment(pixbuf, kCVImageBufferTransferFunctionKey, trc,
                                   kCVAttachmentMode_ShouldPropagate);
     }
+}
+
+// src-over blend of a premultiplied BGRA part into the full-window OSD buffer,
+// with nearest scaling (w,h -> dw,dh) and clipping to the buffer bounds
+static void blend_part(uint32_t *buf, int W, int H, struct sub_bitmap *sb)
+{
+    int dw = sb->dw ? sb->dw : sb->w;
+    int dh = sb->dh ? sb->dh : sb->h;
+    if (dw <= 0 || dh <= 0)
+        return;
+
+    for (int y = 0; y < dh; y++) {
+        int dy = sb->y + y;
+        if (dy < 0 || dy >= H)
+            continue;
+        const uint32_t *src_row =
+            (const uint32_t *)((const uint8_t *)sb->bitmap + (int64_t)(y * sb->h / dh) * sb->stride);
+        uint32_t *dst_row = buf + (int64_t)dy * W;
+        for (int x = 0; x < dw; x++) {
+            int dx = sb->x + x;
+            if (dx < 0 || dx >= W)
+                continue;
+            uint32_t s = src_row[x * sb->w / dw];
+            uint32_t sa = s >> 24;
+            if (sa == 255 || !dst_row[dx]) {
+                dst_row[dx] = s;
+            } else if (s) {
+                uint32_t d = dst_row[dx], inv = 255 - sa;
+                uint32_t b = (s & 0xff) + ((d & 0xff) * inv + 127) / 255;
+                uint32_t g = ((s >> 8) & 0xff) + (((d >> 8) & 0xff) * inv + 127) / 255;
+                uint32_t r = ((s >> 16) & 0xff) + (((d >> 16) & 0xff) * inv + 127) / 255;
+                uint32_t a = sa + ((d >> 24) * inv + 127) / 255;
+                dst_row[dx] = (MPMIN(a, 255u) << 24) | (MPMIN(r, 255u) << 16) |
+                              (MPMIN(g, 255u) << 8) | MPMIN(b, 255u);
+            }
+        }
+    }
+}
+
+static void osd_buf_release(void *info, const void *data, size_t size)
+{
+    talloc_free(info);
+}
+
+static void update_osd(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+
+    CGSize sz = [p->mac window].framePixel.size;
+    int W = sz.width, H = sz.height;
+    if (W < 1 || H < 1)
+        return;
+
+    // margins = the letterbox borders around the aspect-fitted video
+    struct mp_osd_res res = { .w = W, .h = H, .display_par = 1 };
+    if (vo->params) {
+        int dw, dh;
+        mp_image_params_get_dsize(vo->params, &dw, &dh);
+        if (dw > 0 && dh > 0) {
+            int fw = W, fh = H;
+            if ((int64_t)W * dh > (int64_t)H * dw)
+                fw = (int64_t)H * dw / dh;
+            else
+                fh = (int64_t)W * dh / dw;
+            res.ml = res.mr = (W - fw) / 2;
+            res.mt = res.mb = (H - fh) / 2;
+        }
+    }
+
+    static const bool formats[SUBBITMAP_COUNT] = {
+        [SUBBITMAP_BGRA] = true,
+    };
+    struct sub_bitmap_list *list =
+        osd_render(vo->osd, res, p->osd_pts, 0, formats);
+
+    if (list->change_id == p->osd_change_id && osd_res_equals(res, p->osd_res))
+        goto done;
+    p->osd_change_id = list->change_id;
+    p->osd_res = res;
+
+    int num_parts = 0;
+    for (int i = 0; i < list->num_items; i++)
+        num_parts += list->items[i]->num_parts;
+    if (!num_parts) {
+        [p->mac setOsd:NULL];
+        goto done;
+    }
+
+    uint32_t *buf = talloc_zero_size(NULL, (size_t)W * H * 4);
+    for (int i = 0; i < list->num_items; i++) {
+        struct sub_bitmaps *imgs = list->items[i];
+        for (int j = 0; j < imgs->num_parts; j++)
+            blend_part(buf, W, H, &imgs->parts[j]);
+    }
+
+    CGDataProviderRef provider =
+        CGDataProviderCreateWithData(buf, buf, (size_t)W * H * 4, osd_buf_release);
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGImageRef img = CGImageCreate(W, H, 8, 32, (size_t)W * 4, cs,
+                                   kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
+                                   provider, NULL, false, kCGRenderingIntentDefault);
+    CGColorSpaceRelease(cs);
+    CGDataProviderRelease(provider);
+
+    if (img) {
+        [p->mac setOsd:(void *)img];  // transfers the +1 retain
+    } else {
+        talloc_free(buf);
+        [p->mac setOsd:NULL];
+    }
+
+done:
+    talloc_free(list);
 }
 
 static int preinit(struct vo *vo)
@@ -131,9 +252,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     mp_image_t *mpi = NULL;
     if (!frame->redraw && !frame->repeat)
         mpi = mp_image_new_ref(frame->current);
+    if (mpi)
+        p->osd_pts = mpi->pts;
 
     talloc_free(p->next_image);
     p->next_image = mpi;
+
+    update_osd(vo);
     return VO_TRUE;
 }
 
@@ -219,7 +344,6 @@ static void uninit(struct vo *vo)
 const struct vo_driver video_out_avfoundation = {
     .description = "AVFoundation (macOS native scanout, OS-side HDR)",
     .name = "avfoundation",
-    .caps = VO_CAP_NORETAIN,
     .preinit = preinit,
     .query_format = query_format,
     .reconfig = reconfig,

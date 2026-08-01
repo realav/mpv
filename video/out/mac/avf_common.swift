@@ -23,6 +23,7 @@ import AVFoundation
 /// enqueued directly; macOS performs all HDR/EDR tone mapping.
 class AVFCommon: Common {
     @objc var layer: AVSampleBufferDisplayLayer?
+    var osdLayer: CALayer?
 
     @objc init(_ vo: UnsafeMutablePointer<vo>) {
         let log = LogHelper(mp_log_new(vo, vo.pointee.log, "avf"))
@@ -37,6 +38,14 @@ class AVFCommon: Common {
             layer.videoGravity = .resizeAspect
             layer.backgroundColor = NSColor.black.cgColor
             self.layer = layer
+
+            // transparent overlay for mpv's OSD/subtitle bitmaps
+            let osd = CALayer()
+            osd.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+            osd.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
+            layer.addSublayer(osd)
+            self.osdLayer = osd
+
             initMisc(vo)
         }
     }
@@ -70,10 +79,31 @@ class AVFCommon: Common {
                 NSApp.activate(ignoringOtherApps: true)
             }
 
+            updateOsdGeometry()
             windowDidResize()
         }
 
         return true
+    }
+
+    private func updateOsdGeometry() {
+        guard let layer = self.layer, let osd = self.osdLayer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        osd.frame = layer.bounds
+        osd.contentsScale = window?.backingScaleFactor ?? 1
+        CATransaction.commit()
+    }
+
+    // takes ownership of a +1 retained CGImageRef (nil clears the OSD)
+    @objc func setOsd(_ image: UnsafeMutableRawPointer?) {
+        let img = image.map { Unmanaged<CGImage>.fromOpaque($0).takeRetainedValue() }
+        DispatchQueue.main.async {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.osdLayer?.contents = img
+            CATransaction.commit()
+        }
     }
 
     @objc func uninit(_ vo: UnsafeMutablePointer<vo>) {
@@ -109,6 +139,7 @@ class AVFCommon: Common {
 
     override func windowDidChangeBackingProperties() {
         layer?.contentsScale = window?.backingScaleFactor ?? 1
+        updateOsdGeometry()
         windowDidResize()
     }
 
