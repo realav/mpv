@@ -131,8 +131,24 @@ static MP_THREAD_VOID mpv_event_loop_fn(void *arg)
                     continue;
                 handle_dnd(mpv, files, action->u.string);
             }
-            if (!strcmp(prop->name, "input-builtin-drag-and-drop") && prop->format == MPV_FORMAT_FLAG)
+            if (!strcmp(prop->name, "input-builtin-drag-and-drop") && prop->format == MPV_FORMAT_FLAG) {
+                bool was_enabled = enabled;
                 enabled = *(int *)prop->data;
+                // a drop (e.g. a file opened at launch) may have been observed
+                // before the enable flag; replay it now
+                if (enabled && !was_enabled) {
+                    mpv_node node = {0};
+                    if (mpv_get_property(mpv, "dropped-files", MPV_FORMAT_NODE, &node) == MPV_ERROR_SUCCESS) {
+                        mpv_node *action = node_map_get(&node, "action");
+                        mpv_node *files = node_map_get(&node, "files");
+                        if (action && action->format == MPV_FORMAT_STRING &&
+                            files && files->format == MPV_FORMAT_NODE_ARRAY &&
+                            files->u.list->num > 0)
+                            handle_dnd(mpv, files, action->u.string);
+                        mpv_free_node_contents(&node);
+                    }
+                }
+            }
         }
     }
 

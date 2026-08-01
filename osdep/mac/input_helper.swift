@@ -22,6 +22,7 @@ class InputHelper: NSObject {
     var option: OptionHelper?
     var lock = NSCondition()
     private var input: OpaquePointer?
+    private var pendingFiles: [(files: [String], append: Bool)] = []
 
     let keymap: [mp_keymap] = [
         // special keys
@@ -251,18 +252,26 @@ class InputHelper: NSObject {
 
     @objc func open(files: [String], append: Bool = false) {
         lock.withLock {
-            guard let input = input else { return }
-
-            var action = DND_APPEND
-            if !append {
-                action = NSEvent.modifierFlags.contains(.shift) ? DND_APPEND : DND_REPLACE
+            guard let input = input else {
+                // opened via Finder at launch: the event can arrive before the
+                // core's input exists — queue and replay once it is signalled
+                pendingFiles.append((files, append))
+                return
             }
-
-            let filesClean = files.map { $0.hasPrefix("file:///.file/id=") ? (URL(string: $0)?.path ?? $0) : $0 }
-            var filesPtr = filesClean.map { UnsafeMutablePointer<CChar>(strdup($0)) }
-            mp_input_drop_files(input, Int32(files.count), &filesPtr, action)
-            for charPtr in filesPtr { free(UnsafeMutablePointer(mutating: charPtr)) }
+            open(input, files, append)
         }
+    }
+
+    private func open(_ input: OpaquePointer, _ files: [String], _ append: Bool) {
+        var action = DND_APPEND
+        if !append {
+            action = NSEvent.modifierFlags.contains(.shift) ? DND_APPEND : DND_REPLACE
+        }
+
+        let filesClean = files.map { $0.hasPrefix("file:///.file/id=") ? (URL(string: $0)?.path ?? $0) : $0 }
+        var filesPtr = filesClean.map { UnsafeMutablePointer<CChar>(strdup($0)) }
+        mp_input_drop_files(input, Int32(files.count), &filesPtr, action)
+        for charPtr in filesPtr { free(UnsafeMutablePointer(mutating: charPtr)) }
     }
 
     private func useAltGr() -> Bool {
@@ -280,7 +289,11 @@ class InputHelper: NSObject {
     func signal(input: OpaquePointer? = nil) {
         lock.withLock {
             self.input = input
-            if input != nil { lock.signal() }
+            if let input = input {
+                lock.signal()
+                for entry in pendingFiles { open(input, entry.files, entry.append) }
+                pendingFiles = []
+            }
         }
     }
 
