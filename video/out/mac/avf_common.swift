@@ -25,6 +25,7 @@ class AVFCommon: Common {
     @objc var layer: AVSampleBufferDisplayLayer?
     var rootLayer: CALayer?
     var osdLayer: CALayer?
+    var osdPixelBuffer: CVPixelBuffer?
 
     @objc init(_ vo: UnsafeMutablePointer<vo>) {
         let log = LogHelper(mp_log_new(vo, vo.pointee.log, "avf"))
@@ -95,20 +96,23 @@ class AVFCommon: Common {
         return true
     }
 
-    // takes ownership of a +1 retained CGImageRef (nil clears the OSD);
-    // x/y/w/h = bounding box in window pixels, top-left origin (view is flipped)
-    @objc func setOsd(_ image: UnsafeMutableRawPointer?, x: Int32, y: Int32, w: Int32, h: Int32) {
-        let img = image.map { Unmanaged<CGImage>.fromOpaque($0).takeRetainedValue() }
+    // takes ownership of a +1 retained CVPixelBufferRef (nil clears the OSD);
+    // the buffer is IOSurface-backed, so CoreAnimation displays it zero-copy
+    @objc func setOsd(_ pixelBuffer: UnsafeMutableRawPointer?) {
+        let pb = pixelBuffer.map { Unmanaged<CVPixelBuffer>.fromOpaque($0).takeRetainedValue() }
         DispatchQueue.main.async {
-            guard let osd = self.osdLayer else { return }
-            let scale = self.window?.backingScaleFactor ?? 1
+            guard let osd = self.osdLayer, let root = self.rootLayer else { return }
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            osd.contentsScale = scale
-            osd.frame = CGRect(x: CGFloat(x) / scale, y: CGFloat(y) / scale,
-                               width: CGFloat(w) / scale, height: CGFloat(h) / scale)
-            osd.contents = img
+            if let pb, let surface = CVPixelBufferGetIOSurface(pb)?.takeUnretainedValue() {
+                osd.contentsScale = self.window?.backingScaleFactor ?? 1
+                osd.frame = root.bounds
+                osd.contents = surface
+            } else {
+                osd.contents = nil
+            }
             CATransaction.commit()
+            self.osdPixelBuffer = pb  // keep the surface alive while displayed
         }
     }
 
