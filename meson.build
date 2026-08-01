@@ -1676,6 +1676,10 @@ if features['cocoa'] and features['vulkan'] and features['swift']
                            'video/out/mac/metal_layer.swift')
     sources += files('video/out/vulkan/context_mac.m')
 endif
+if features['cocoa'] and features['swift'] and features['avfoundation']
+    swift_sources += files('video/out/mac/avf_common.swift')
+    sources += files('video/out/vo_avfoundation.m')
+endif
 
 macos_media_player = get_option('macos-media-player').require(
     features['swift'],
