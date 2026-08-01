@@ -45,7 +45,7 @@ struct priv {
     double osd_pts;
     struct mp_osd_res osd_res;
     int64_t osd_change_id;
-    uint32_t *osd_buf;
+    bool osd_empty;
 };
 
 // Attach colorimetry from mpv's params if the decoder didn't tag the buffer;
@@ -81,31 +81,37 @@ static void set_color_attachments(struct vo *vo, CVPixelBufferRef pixbuf)
     }
 }
 
-// src-over blend of a premultiplied BGRA part into the full-window OSD buffer,
-// with nearest scaling (w,h -> dw,dh) and clipping to the buffer bounds
-static void blend_part(uint32_t *buf, int W, int H, struct sub_bitmap *sb)
+// src-over blend of a premultiplied BGRA part into the bounding-box buffer
+// (bx,by = buffer origin in window coords), with nearest scaling (w,h -> dw,dh).
+// Returns true if any non-transparent pixel was written.
+static bool blend_part(uint32_t *buf, int bx, int by, int W, int H,
+                       struct sub_bitmap *sb)
 {
     int dw = sb->dw ? sb->dw : sb->w;
     int dh = sb->dh ? sb->dh : sb->h;
     if (dw <= 0 || dh <= 0)
-        return;
+        return false;
 
+    bool visible = false;
     for (int y = 0; y < dh; y++) {
-        int dy = sb->y + y;
+        int dy = sb->y + y - by;
         if (dy < 0 || dy >= H)
             continue;
         const uint32_t *src_row =
             (const uint32_t *)((const uint8_t *)sb->bitmap + (int64_t)(y * sb->h / dh) * sb->stride);
         uint32_t *dst_row = buf + (int64_t)dy * W;
         for (int x = 0; x < dw; x++) {
-            int dx = sb->x + x;
+            int dx = sb->x + x - bx;
             if (dx < 0 || dx >= W)
                 continue;
             uint32_t s = src_row[x * sb->w / dw];
+            if (!s)
+                continue;
+            visible = true;
             uint32_t sa = s >> 24;
             if (sa == 255 || !dst_row[dx]) {
                 dst_row[dx] = s;
-            } else if (s) {
+            } else {
                 uint32_t d = dst_row[dx], inv = 255 - sa;
                 uint32_t b = (s & 0xff) + ((d & 0xff) * inv + 127) / 255;
                 uint32_t g = ((s >> 8) & 0xff) + (((d >> 8) & 0xff) * inv + 127) / 255;
@@ -116,11 +122,15 @@ static void blend_part(uint32_t *buf, int W, int H, struct sub_bitmap *sb)
             }
         }
     }
+    return visible;
 }
 
-static void osd_buf_release(void *info, const void *data, size_t size)
+static void clear_osd(struct priv *p)
 {
-    talloc_free(info);
+    if (!p->osd_empty) {
+        [p->mac setOsd:NULL x:0 y:0 w:0 h:0];
+        p->osd_empty = true;
+    }
 }
 
 static void update_osd(struct vo *vo)
@@ -159,35 +169,60 @@ static void update_osd(struct vo *vo)
     p->osd_change_id = list->change_id;
     p->osd_res = res;
 
-    int num_parts = 0;
-    for (int i = 0; i < list->num_items; i++)
-        num_parts += list->items[i]->num_parts;
-    if (!num_parts) {
-        [p->mac setOsd:NULL];
+    // bounding box of all parts, clipped to the window
+    int x0 = W, y0 = H, x1 = 0, y1 = 0;
+    for (int i = 0; i < list->num_items; i++) {
+        struct sub_bitmaps *imgs = list->items[i];
+        for (int j = 0; j < imgs->num_parts; j++) {
+            struct sub_bitmap *sb = &imgs->parts[j];
+            int dw = sb->dw ? sb->dw : sb->w, dh = sb->dh ? sb->dh : sb->h;
+            x0 = MPMIN(x0, MPMAX(sb->x, 0));
+            y0 = MPMIN(y0, MPMAX(sb->y, 0));
+            x1 = MPMAX(x1, MPMIN(sb->x + dw, W));
+            y1 = MPMAX(y1, MPMIN(sb->y + dh, H));
+        }
+    }
+    int bw = x1 - x0, bh = y1 - y0;
+    if (bw <= 0 || bh <= 0) {
+        clear_osd(p);
         goto done;
     }
 
-    uint32_t *buf = talloc_zero_size(NULL, (size_t)W * H * 4);
+    // CA-friendly bitmap sized to the bounding box, not the whole window
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(NULL, bw, bh, 8, 0, cs,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGColorSpaceRelease(cs);
+    if (!ctx) {
+        clear_osd(p);
+        goto done;
+    }
+
+    uint32_t *buf = CGBitmapContextGetData(ctx);
+    int stride32 = CGBitmapContextGetBytesPerRow(ctx) / 4;
+    memset(buf, 0, (size_t)CGBitmapContextGetBytesPerRow(ctx) * bh);
+
+    bool visible = false;
     for (int i = 0; i < list->num_items; i++) {
         struct sub_bitmaps *imgs = list->items[i];
         for (int j = 0; j < imgs->num_parts; j++)
-            blend_part(buf, W, H, &imgs->parts[j]);
+            visible |= blend_part(buf, x0, y0, stride32, bh, &imgs->parts[j]);
     }
 
-    CGDataProviderRef provider =
-        CGDataProviderCreateWithData(buf, buf, (size_t)W * H * 4, osd_buf_release);
-    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGImageRef img = CGImageCreate(W, H, 8, 32, (size_t)W * 4, cs,
-                                   kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
-                                   provider, NULL, false, kCGRenderingIntentDefault);
-    CGColorSpaceRelease(cs);
-    CGDataProviderRelease(provider);
+    // e.g. a faded-out OSC still submits fully transparent bitmaps every tick
+    if (!visible) {
+        CGContextRelease(ctx);
+        clear_osd(p);
+        goto done;
+    }
 
+    CGImageRef img = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
     if (img) {
-        [p->mac setOsd:(void *)img];  // transfers the +1 retain
+        [p->mac setOsd:(void *)img x:x0 y:y0 w:bw h:bh];  // transfers the +1 retain
+        p->osd_empty = false;
     } else {
-        talloc_free(buf);
-        [p->mac setOsd:NULL];
+        clear_osd(p);
     }
 
 done:

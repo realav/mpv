@@ -23,6 +23,7 @@ import AVFoundation
 /// enqueued directly; macOS performs all HDR/EDR tone mapping.
 class AVFCommon: Common {
     @objc var layer: AVSampleBufferDisplayLayer?
+    var rootLayer: CALayer?
     var osdLayer: CALayer?
 
     @objc init(_ vo: UnsafeMutablePointer<vo>) {
@@ -33,17 +34,25 @@ class AVFCommon: Common {
         input = InputHelper(vo.pointee.input_ctx, option)
 
         DispatchQueue.main.sync {
+            // plain container as the view's backing layer; the video and OSD
+            // layers are siblings, so OSD updates composite on the GPU instead
+            // of being CPU-converted into the video layer's EDR colorspace
+            let root = CALayer()
+            root.backgroundColor = NSColor.black.cgColor
+            self.rootLayer = root
+
             let layer = AVSampleBufferDisplayLayer()
             // mpv positions/letterboxes via the window; the layer only scales
             layer.videoGravity = .resizeAspect
-            layer.backgroundColor = NSColor.black.cgColor
+            layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+            root.addSublayer(layer)
             self.layer = layer
 
-            // transparent overlay for mpv's OSD/subtitle bitmaps
+            // transparent overlay for mpv's OSD/subtitle bitmaps; sized and
+            // positioned per update to the OSD's bounding box
             let osd = CALayer()
-            osd.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
             osd.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
-            layer.addSublayer(osd)
+            root.addSublayer(osd)
             self.osdLayer = osd
 
             initMisc(vo)
@@ -58,15 +67,16 @@ class AVFCommon: Common {
             initApp()
 
             let (screen, wr, forcePosition) = getInitProperties(vo)
-            guard let layer = self.layer else {
+            guard let root = self.rootLayer, let layer = self.layer else {
                 log.error("Something went wrong, no AVSampleBufferDisplayLayer was initialized")
                 exit(1)
             }
 
             if window == nil {
-                initView(vo, layer)
+                initView(vo, root)
                 initWindow(vo, previousActiveApp)
                 initWindowState()
+                layer.frame = root.bounds
             }
 
             if forcePosition {
@@ -79,29 +89,25 @@ class AVFCommon: Common {
                 NSApp.activate(ignoringOtherApps: true)
             }
 
-            updateOsdGeometry()
             windowDidResize()
         }
 
         return true
     }
 
-    private func updateOsdGeometry() {
-        guard let layer = self.layer, let osd = self.osdLayer else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        osd.frame = layer.bounds
-        osd.contentsScale = window?.backingScaleFactor ?? 1
-        CATransaction.commit()
-    }
-
-    // takes ownership of a +1 retained CGImageRef (nil clears the OSD)
-    @objc func setOsd(_ image: UnsafeMutableRawPointer?) {
+    // takes ownership of a +1 retained CGImageRef (nil clears the OSD);
+    // x/y/w/h = bounding box in window pixels, top-left origin (view is flipped)
+    @objc func setOsd(_ image: UnsafeMutableRawPointer?, x: Int32, y: Int32, w: Int32, h: Int32) {
         let img = image.map { Unmanaged<CGImage>.fromOpaque($0).takeRetainedValue() }
         DispatchQueue.main.async {
+            guard let osd = self.osdLayer else { return }
+            let scale = self.window?.backingScaleFactor ?? 1
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            self.osdLayer?.contents = img
+            osd.contentsScale = scale
+            osd.frame = CGRect(x: CGFloat(x) / scale, y: CGFloat(y) / scale,
+                               width: CGFloat(w) / scale, height: CGFloat(h) / scale)
+            osd.contents = img
             CATransaction.commit()
         }
     }
@@ -138,8 +144,9 @@ class AVFCommon: Common {
     }
 
     override func windowDidChangeBackingProperties() {
-        layer?.contentsScale = window?.backingScaleFactor ?? 1
-        updateOsdGeometry()
+        let scale = window?.backingScaleFactor ?? 1
+        rootLayer?.contentsScale = scale
+        layer?.contentsScale = scale
         windowDidResize()
     }
 
