@@ -27,12 +27,21 @@ class AVFCommon: Common {
     var osdLayer: CALayer?
     var osdPixelBuffer: CVPixelBuffer?
 
+    // display-link vsync pacing, same as MacCommon: flip blocks until the
+    // next display refresh so mpv's display-sync sees real vsync cadence
+    var presentation: Presentation?
+    var timer: PreciseTimer?
+    var swapTime: UInt64 = 0
+    let swapLock: NSCondition = NSCondition()
+
     @objc init(_ vo: UnsafeMutablePointer<vo>) {
         let log = LogHelper(mp_log_new(vo, vo.pointee.log, "avf"))
         let option = OptionHelper(vo, vo.pointee.global)
         super.init(option, log)
         eventsLock.withLock { self.vo = vo }
         input = InputHelper(vo.pointee.input_ctx, option)
+        presentation = Presentation(common: self)
+        timer = PreciseTimer(common: self)
 
         DispatchQueue.main.sync {
             // plain container as the view's backing layer; the video and OSD
@@ -119,12 +128,73 @@ class AVFCommon: Common {
     @objc func uninit(_ vo: UnsafeMutablePointer<vo>) {
         window?.waitForAnimation()
 
+        timer?.terminate()
+
         DispatchQueue.main.sync {
             window?.delegate = nil
             window?.close()
 
             uninitCommon()
         }
+    }
+
+    @objc func swapBuffer() {
+        if option.mac.macos_render_timer > RENDER_TIMER_SYSTEM {
+            swapLock.lock()
+            while swapTime < 1 {
+                swapLock.wait()
+            }
+            swapTime = 0
+            swapLock.unlock()
+        }
+    }
+
+    @objc func fillVsync(info: UnsafeMutablePointer<vo_vsync_info>) {
+        if option.mac.macos_render_timer != RENDER_TIMER_PRESENTATION_FEEDBACK { return }
+
+        let next = presentation?.next()
+        info.pointee.vsync_duration = next?.duration ?? -1
+        info.pointee.skipped_vsyncs = next?.skipped ?? -1
+        info.pointee.last_queue_display_time = next?.time ?? -1
+    }
+
+    override func displayLinkCallback(_ displayLink: CVDisplayLink,
+                                      _ inNow: UnsafePointer<CVTimeStamp>,
+                                      _ inOutputTime: UnsafePointer<CVTimeStamp>,
+                                      _ flagsIn: CVOptionFlags,
+                                      _ flagsOut: UnsafeMutablePointer<CVOptionFlags>) -> CVReturn {
+        let signalSwap = {
+            self.swapLock.lock()
+            self.swapTime += 1
+            self.swapLock.signal()
+            self.swapLock.unlock()
+        }
+
+        if option.mac.macos_render_timer > RENDER_TIMER_SYSTEM {
+            if let timer = self.timer, option.mac.macos_render_timer == RENDER_TIMER_PRECISE {
+                timer.scheduleAt(time: inOutputTime.pointee.hostTime, closure: signalSwap)
+                return kCVReturnSuccess
+            }
+
+            signalSwap()
+            return kCVReturnSuccess
+        }
+
+        if option.mac.macos_render_timer == RENDER_TIMER_PRESENTATION_FEEDBACK {
+            presentation?.add(time: inOutputTime.pointee)
+        }
+
+        return kCVReturnSuccess
+    }
+
+    override func startDisplayLink(_ vo: UnsafeMutablePointer<vo>) {
+        super.startDisplayLink(vo)
+        timer?.updatePolicy(periodSeconds: 1 / currentFps())
+    }
+
+    override func updateDisplaylink() {
+        super.updateDisplaylink()
+        timer?.updatePolicy(periodSeconds: 1 / currentFps())
     }
 
     // opaque pointer to keep CoreMedia types out of the generated ObjC header

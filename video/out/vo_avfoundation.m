@@ -376,6 +376,14 @@ static void flip_page(struct vo *vo)
 
 done:
     mp_image_unrefp(&p->next_image);
+    // block until the next display refresh so display-sync sees real vsyncs
+    [p->mac swapBuffer];
+}
+
+static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
+{
+    struct priv *p = vo->priv;
+    [p->mac fillVsyncWithInfo:info];
 }
 
 static int control(struct vo *vo, uint32_t request, void *data)
@@ -415,6 +423,7 @@ const struct vo_driver video_out_avfoundation = {
     .control = control,
     .draw_frame = draw_frame,
     .flip_page = flip_page,
+    .get_vsync = get_vsync,
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
 };
