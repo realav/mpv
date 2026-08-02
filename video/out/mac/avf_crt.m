@@ -38,8 +38,11 @@ constant float SHAPE = 2.0;\n\
 struct Prm {\n\
     float2 videoSize;\n\
     float2 outSize;\n\
+    float2 fitOff;\n\
+    float2 fitSize;\n\
     float lumaScale;\n\
-    int mtx601;\n\
+    int mtxSel;\n\
+    int isPq;\n\
 };\n\
 static float3 linearize3(float3 c) {\n\
     c = max(c, 0.0);\n\
@@ -52,6 +55,26 @@ static float3 delinearize3(float3 c) {\n\
 static float gauss1d(float p, float scale) {\n\
     return exp2(scale * pow(abs(p), SHAPE));\n\
 }\n\
+static float3 pq_to_linear(float3 e) {\n\
+    // PQ EOTF -> luminance normalized to SDR reference white (203 nits)\n\
+    const float m1 = 2610.0/16384.0, m2 = 2523.0/4096.0*128.0;\n\
+    const float c1 = 3424.0/4096.0, c2 = 2413.0/4096.0*32.0, c3 = 2392.0/4096.0*32.0;\n\
+    float3 p = pow(max(e, 0.0), 1.0/m2);\n\
+    float3 nits = pow(max(p - c1, 0.0) / (c2 - c3*p), 1.0/m1) * 10000.0;\n\
+    return nits / 203.0;\n\
+}\n\
+static float3 tonemap_reinhard(float3 x) {\n\
+    const float peak = 1000.0/203.0;\n\
+    float m = max(x.r, max(x.g, x.b));\n\
+    if (m <= 0.0) return x;\n\
+    float t = m * (1.0 + m/(peak*peak)) / (1.0 + m);\n\
+    return x * (t / m);\n\
+}\n\
+static float3 bt2020_to_709(float3 c) {\n\
+    return float3( 1.6605*c.r - 0.5876*c.g - 0.0728*c.b,\n\
+                  -0.1246*c.r + 1.1329*c.g - 0.0083*c.b,\n\
+                  -0.0182*c.r - 0.1006*c.g + 1.1187*c.b);\n\
+}\n\
 kernel void crt_lottes(texture2d<float, access::sample> luma [[texture(0)]],\n\
                        texture2d<float, access::sample> chroma [[texture(1)]],\n\
                        texture2d<float, access::write> outTex [[texture(2)]],\n\
@@ -59,18 +82,33 @@ kernel void crt_lottes(texture2d<float, access::sample> luma [[texture(0)]],\n\
                        uint2 gid [[thread_position_in_grid]])\n\
 {\n\
     if (gid.x >= uint(prm.outSize.x) || gid.y >= uint(prm.outSize.y)) return;\n\
+    // aspect-fitted video rect; outside it: black bars\n\
+    float2 pos = (float2(gid) + 0.5 - prm.fitOff) / prm.fitSize;\n\
+    if (pos.x < 0.0 || pos.x >= 1.0 || pos.y < 0.0 || pos.y >= 1.0) {\n\
+        outTex.write(float4(0.0, 0.0, 0.0, 1.0), gid);\n\
+        return;\n\
+    }\n\
     constexpr sampler smp(filter::linear, address::clamp_to_edge);\n\
-    float2 pos = (float2(gid) + 0.5) / prm.outSize;\n\
     float y = luma.sample(smp, pos).r * prm.lumaScale;\n\
     float2 c = chroma.sample(smp, pos).rg * prm.lumaScale;\n\
     y = (y - 16.0/255.0) / (219.0/255.0);\n\
     c = (c - 128.0/255.0) / (224.0/255.0);\n\
     float3 rgb;\n\
-    if (prm.mtx601 != 0)\n\
+    if (prm.mtxSel == 1)\n\
         rgb = float3(y + 1.402*c.y, y - 0.344136*c.x - 0.714136*c.y, y + 1.772*c.x);\n\
+    else if (prm.mtxSel == 2)\n\
+        rgb = float3(y + 1.4746*c.y, y - 0.16455*c.x - 0.57135*c.y, y + 1.8814*c.x);\n\
     else\n\
         rgb = float3(y + 1.5748*c.y, y - 0.18732*c.x - 0.46812*c.y, y + 1.8556*c.x);\n\
-    float3 lin = linearize3(BRIGHTNESS_BOOST * clamp(rgb, 0.0, 1.0));\n\
+    rgb = clamp(rgb, 0.0, 1.0);\n\
+    float3 lin;\n\
+    if (prm.isPq != 0) {\n\
+        // HDR: PQ -> linear, tone-map to SDR range, 2020 -> 709 gamut\n\
+        lin = clamp(bt2020_to_709(tonemap_reinhard(pq_to_linear(rgb))), 0.0, 1.0);\n\
+        lin *= BRIGHTNESS_BOOST;\n\
+    } else {\n\
+        lin = linearize3(BRIGHTNESS_BOOST * rgb);\n\
+    }\n\
     float dsty = -fract(pos.y * prm.videoSize.y - 0.5);\n\
     float wsum = gauss1d(dsty - 1.0, HARD_SCAN) + gauss1d(dsty, HARD_SCAN) +\n\
                  gauss1d(dsty + 1.0, HARD_SCAN);\n\
@@ -224,16 +262,45 @@ CVPixelBufferRef avf_crt_process(struct avf_crt *crt, CVPixelBufferRef in,
     if (!luma || !chroma || !dst)
         goto error;
 
+    // HLG is left native (no CRT); PQ is tone-mapped in the kernel
+    if (params && params->color.transfer == PL_COLOR_TRC_HLG)
+        goto error;
+
+    // aspect-fitted destination rect (same letterboxing the layer would do)
+    int dw = out_w, dh = out_h;
+    if (params) {
+        int vw, vh;
+        mp_image_params_get_dsize((struct mp_image_params *)params, &vw, &vh);
+        if (vw > 0 && vh > 0) {
+            if ((int64_t)out_w * vh > (int64_t)out_h * vw)
+                dw = (int64_t)out_h * vw / vh;
+            else
+                dh = (int64_t)out_w * vh / vw;
+        }
+    }
+
+    int mtx_sel = 0;
+    if (params && params->repr.sys == PL_COLOR_SYSTEM_BT_601)
+        mtx_sel = 1;
+    if (params && params->repr.sys == PL_COLOR_SYSTEM_BT_2020_NC)
+        mtx_sel = 2;
+
     struct {
         float videoSize[2];
         float outSize[2];
+        float fitOff[2];
+        float fitSize[2];
         float lumaScale;
-        int mtx601;
+        int mtxSel;
+        int isPq;
     } prm = {
         .videoSize = {CVPixelBufferGetWidth(in), CVPixelBufferGetHeight(in)},
         .outSize = {out_w, out_h},
+        .fitOff = {(out_w - dw) / 2.0f, (out_h - dh) / 2.0f},
+        .fitSize = {dw, dh},
         .lumaScale = luma_scale,
-        .mtx601 = params && params->repr.sys == PL_COLOR_SYSTEM_BT_601,
+        .mtxSel = mtx_sel,
+        .isPq = params && params->color.transfer == PL_COLOR_TRC_PQ,
     };
 
     id<MTLCommandBuffer> cb = [crt->queue commandBuffer];

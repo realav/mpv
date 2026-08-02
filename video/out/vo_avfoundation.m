@@ -428,9 +428,7 @@ static void flip_page(struct vo *vo)
             break;
         }
     }
-    bool is_hdr = vo->params && (vo->params->color.transfer == PL_COLOR_TRC_PQ ||
-                                 vo->params->color.transfer == PL_COLOR_TRC_HLG);
-    if (want_crt && !is_hdr) {
+    if (want_crt) {
         if (!p->crt && !p->crt_failed) {
             p->crt = avf_crt_create(vo->log);
             if (!p->crt)
