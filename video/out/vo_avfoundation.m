@@ -48,6 +48,12 @@ struct priv {
     int64_t osd_change_id;
     bool osd_empty;
     int64_t osd_last_ns;
+
+    // upload pool for software-decoded frames (formats VideoToolbox
+    // can't hardware-decode still display through the native layer)
+    CVPixelBufferPoolRef upload_pool;
+    int upload_w, upload_h;
+    OSType upload_fmt;
     // per-item double-buffered IOSurface atlases; parts are GPU-composited
     // CALayers cropping into these via contentsRect
     struct {
@@ -89,6 +95,73 @@ static void set_color_attachments(struct vo *vo, CVPixelBufferRef pixbuf)
             CVBufferSetAttachment(pixbuf, kCVImageBufferTransferFunctionKey, trc,
                                   kCVAttachmentMode_ShouldPropagate);
     }
+
+    if (!CVBufferGetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey, NULL)) {
+        CFStringRef mtx = NULL;
+        switch (params->repr.sys) {
+        case PL_COLOR_SYSTEM_BT_601:     mtx = kCVImageBufferYCbCrMatrix_ITU_R_601_4; break;
+        case PL_COLOR_SYSTEM_BT_709:     mtx = kCVImageBufferYCbCrMatrix_ITU_R_709_2; break;
+        case PL_COLOR_SYSTEM_BT_2020_NC: mtx = kCVImageBufferYCbCrMatrix_ITU_R_2020; break;
+        default: break;
+        }
+        if (mtx)
+            CVBufferSetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey, mtx,
+                                  kCVAttachmentMode_ShouldPropagate);
+    }
+}
+
+// copy a software NV12/P010 frame into an IOSurface-backed CVPixelBuffer
+static CVPixelBufferRef upload_sw_frame(struct vo *vo, struct mp_image *mpi)
+{
+    struct priv *p = vo->priv;
+
+    bool p010 = mpi->imgfmt == IMGFMT_P010;
+    bool full = vo->params && vo->params->repr.levels == PL_COLOR_LEVELS_FULL;
+    OSType fmt = p010
+        ? (full ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        : (full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+
+    if (!p->upload_pool || p->upload_w != mpi->w || p->upload_h != mpi->h ||
+        p->upload_fmt != fmt)
+    {
+        if (p->upload_pool) {
+            CVPixelBufferPoolRelease(p->upload_pool);
+            p->upload_pool = NULL;
+        }
+        NSDictionary *attrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(fmt),
+            (id)kCVPixelBufferWidthKey: @(mpi->w),
+            (id)kCVPixelBufferHeightKey: @(mpi->h),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        };
+        if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
+                (__bridge CFDictionaryRef)attrs,
+                &p->upload_pool) != kCVReturnSuccess)
+            return NULL;
+        p->upload_w = mpi->w;
+        p->upload_h = mpi->h;
+        p->upload_fmt = fmt;
+    }
+
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, p->upload_pool,
+                                           &pb) != kCVReturnSuccess || !pb)
+        return NULL;
+
+    CVPixelBufferLockBaseAddress(pb, 0);
+    for (int i = 0; i < 2; i++) {
+        uint8_t *dst = CVPixelBufferGetBaseAddressOfPlane(pb, i);
+        size_t dst_stride = CVPixelBufferGetBytesPerRowOfPlane(pb, i);
+        int rows = CVPixelBufferGetHeightOfPlane(pb, i);
+        size_t bytes = (size_t)mpi->w * (p010 ? 2 : 1);
+        for (int y = 0; y < rows; y++)
+            memcpy(dst + (size_t)y * dst_stride,
+                   mpi->planes[i] + (int64_t)y * mpi->stride[i], bytes);
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    return pb;  // +1
 }
 
 static void clear_osd(struct priv *p)
@@ -272,7 +345,10 @@ static int preinit(struct vo *vo)
 
 static int query_format(struct vo *vo, int format)
 {
-    return format == IMGFMT_VIDEOTOOLBOX;
+    // hw frames pass through; sw frames are uploaded (mpv auto-converts
+    // other sw formats to one of these)
+    return format == IMGFMT_VIDEOTOOLBOX || format == IMGFMT_NV12 ||
+           format == IMGFMT_P010;
 }
 
 static int reconfig(struct vo *vo, struct mp_image_params *params)
@@ -318,7 +394,14 @@ static void flip_page(struct vo *vo)
     if (!p->next_image)
         return;
 
-    CVPixelBufferRef pixbuf = (CVPixelBufferRef)p->next_image->planes[3];
+    CVPixelBufferRef pixbuf = NULL;
+    bool owned = false;
+    if (p->next_image->imgfmt == IMGFMT_VIDEOTOOLBOX) {
+        pixbuf = (CVPixelBufferRef)p->next_image->planes[3];
+    } else {
+        pixbuf = upload_sw_frame(vo, p->next_image);
+        owned = true;
+    }
     if (!pixbuf)
         goto done;
 
@@ -362,6 +445,8 @@ static void flip_page(struct vo *vo)
     CFRelease(sbuf);
 
 done:
+    if (owned && pixbuf)
+        CVPixelBufferRelease(pixbuf);
     mp_image_unrefp(&p->next_image);
     // block until the next display refresh so display-sync sees real vsyncs
     [p->mac swapBuffer];
@@ -397,6 +482,8 @@ static void uninit(struct vo *vo)
                 CVPixelBufferRelease(p->osd_items[i].pb[j]);
         }
     }
+    if (p->upload_pool)
+        CVPixelBufferPoolRelease(p->upload_pool);
 
     hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
     av_buffer_unref(&p->hwctx.av_device_ref);
