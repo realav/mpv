@@ -17,6 +17,7 @@
 
 import Cocoa
 import AVFoundation
+import IOSurface
 
 /// Window host for vo_avfoundation: mpv's usual Cocoa window/input handling
 /// with an AVSampleBufferDisplayLayer as the content layer. Video frames are
@@ -24,8 +25,7 @@ import AVFoundation
 class AVFCommon: Common {
     @objc var layer: AVSampleBufferDisplayLayer?
     var rootLayer: CALayer?
-    var osdLayer: CALayer?
-    var osdPixelBuffer: CVPixelBuffer?
+    var osdPartLayers: [CALayer] = []
     var edrWarmup: CAMetalLayer?
 
     // display-link vsync pacing, same as MacCommon: flip blocks until the
@@ -58,13 +58,6 @@ class AVFCommon: Common {
             layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
             root.addSublayer(layer)
             self.layer = layer
-
-            // transparent overlay for mpv's OSD/subtitle bitmaps; sized and
-            // positioned per update to the OSD's bounding box
-            let osd = CALayer()
-            osd.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
-            root.addSublayer(osd)
-            self.osdLayer = osd
 
             initMisc(vo)
         }
@@ -106,23 +99,55 @@ class AVFCommon: Common {
         return true
     }
 
-    // takes ownership of a +1 retained CVPixelBufferRef (nil clears the OSD);
-    // the buffer is IOSurface-backed, so CoreAnimation displays it zero-copy
-    @objc func setOsd(_ pixelBuffer: UnsafeMutableRawPointer?) {
-        let pb = pixelBuffer.map { Unmanaged<CVPixelBuffer>.fromOpaque($0).takeRetainedValue() }
+    // display OSD parts as GPU-composited layers: each descriptor is 9 ints
+    // {surfaceIdx, srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH} in window
+    // pixels; contentsRect crops the item's IOSurface atlas on the GPU
+    @objc func setOsdParts(_ surfaces: UnsafePointer<UnsafeMutableRawPointer?>?,
+                           surfaceCount: Int32,
+                           descs: UnsafePointer<Int32>?,
+                           partCount: Int32) {
+        // copy out of the C arrays before this call returns
+        var surfs: [IOSurface] = []
+        if let surfaces {
+            for i in 0..<Int(surfaceCount) {
+                guard let s = surfaces[i] else { continue }
+                surfs.append(Unmanaged<IOSurface>.fromOpaque(s).takeUnretainedValue())
+            }
+        }
+        let np = Int(partCount)
+        let d: [Int32] = descs.map { Array(UnsafeBufferPointer(start: $0, count: np * 9)) } ?? []
+
         DispatchQueue.main.async {
-            guard let osd = self.osdLayer, let root = self.rootLayer else { return }
+            guard let root = self.rootLayer else { return }
+            let scale = self.window?.backingScaleFactor ?? 1
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            if let pb, let surface = CVPixelBufferGetIOSurface(pb)?.takeUnretainedValue() {
-                osd.contentsScale = self.window?.backingScaleFactor ?? 1
-                osd.frame = root.bounds
-                osd.contents = surface
-            } else {
-                osd.contents = nil
+            while self.osdPartLayers.count < np {
+                let l = CALayer()
+                l.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull(),
+                             "hidden": NSNull(), "contentsRect": NSNull()]
+                l.contentsGravity = .resize
+                l.isOpaque = false
+                root.addSublayer(l)
+                self.osdPartLayers.append(l)
+            }
+            for i in 0..<self.osdPartLayers.count {
+                let l = self.osdPartLayers[i]
+                if i < np, case let o = i * 9, Int(d[o]) < surfs.count {
+                    let surf = surfs[Int(d[o])]
+                    let pw = CGFloat(surf.width), ph = CGFloat(surf.height)
+                    l.contents = surf
+                    l.contentsRect = CGRect(x: CGFloat(d[o + 1]) / pw, y: CGFloat(d[o + 2]) / ph,
+                                            width: CGFloat(d[o + 3]) / pw, height: CGFloat(d[o + 4]) / ph)
+                    l.frame = CGRect(x: CGFloat(d[o + 5]) / scale, y: CGFloat(d[o + 6]) / scale,
+                                     width: CGFloat(d[o + 7]) / scale, height: CGFloat(d[o + 8]) / scale)
+                    l.isHidden = false
+                } else if !l.isHidden {
+                    l.isHidden = true
+                    l.contents = nil
+                }
             }
             CATransaction.commit()
-            self.osdPixelBuffer = pb  // keep the surface alive while displayed
         }
     }
 

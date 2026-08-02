@@ -48,13 +48,15 @@ struct priv {
     int64_t osd_change_id;
     bool osd_empty;
     int64_t osd_last_ns;
-    // ping-pong IOSurface buffers; each remembers which rows it dirtied so
-    // the next reuse clears only those instead of the whole 4K surface
-    CVPixelBufferRef osd_pb[2];
-    int osd_pb_dirty[2][2];
-    int osd_pb_idx;
-    int osd_pb_w, osd_pb_h;
+    // per-item double-buffered IOSurface atlases; parts are GPU-composited
+    // CALayers cropping into these via contentsRect
+    struct {
+        CVPixelBufferRef pb[2];
+        int front, w, h, change_id;
+    } osd_items[MAX_OSD_PARTS];
 };
+
+#define OSD_MAX_LAYERS 512
 
 // Attach colorimetry from mpv's params if the decoder didn't tag the buffer;
 // macOS needs these to select the correct (HDR) tone mapping.
@@ -89,97 +91,72 @@ static void set_color_attachments(struct vo *vo, CVPixelBufferRef pixbuf)
     }
 }
 
-// src-over blend of a premultiplied BGRA part into the bounding-box buffer
-// (bx,by = buffer origin in window coords), with nearest scaling (w,h -> dw,dh).
-// Returns true if any non-transparent pixel was written.
-static bool blend_part(uint32_t *buf, int bx, int by, int W, int H,
-                       struct sub_bitmap *sb)
-{
-    int dw = sb->dw ? sb->dw : sb->w;
-    int dh = sb->dh ? sb->dh : sb->h;
-    if (dw <= 0 || dh <= 0)
-        return false;
-
-    bool scaled = dw != sb->w || dh != sb->h;
-    bool visible = false;
-    for (int y = 0; y < dh; y++) {
-        int dy = sb->y + y - by;
-        if (dy < 0 || dy >= H)
-            continue;
-        const uint32_t *src_row =
-            (const uint32_t *)((const uint8_t *)sb->bitmap +
-                               (int64_t)(scaled ? y * sb->h / dh : y) * sb->stride);
-        uint32_t *dst_row = buf + (int64_t)dy * W;
-        for (int x = 0; x < dw; x++) {
-            int dx = sb->x + x - bx;
-            if (dx < 0 || dx >= W)
-                continue;
-            uint32_t s = src_row[scaled ? x * sb->w / dw : x];
-            if (!s)
-                continue;
-            visible = true;
-            uint32_t sa = s >> 24;
-            if (sa == 255 || !dst_row[dx]) {
-                dst_row[dx] = s;
-            } else {
-                uint32_t d = dst_row[dx], inv = 255 - sa;
-                uint32_t b = (s & 0xff) + ((d & 0xff) * inv + 127) / 255;
-                uint32_t g = ((s >> 8) & 0xff) + (((d >> 8) & 0xff) * inv + 127) / 255;
-                uint32_t r = ((s >> 16) & 0xff) + (((d >> 16) & 0xff) * inv + 127) / 255;
-                uint32_t a = sa + ((d >> 24) * inv + 127) / 255;
-                dst_row[dx] = (MPMIN(a, 255u) << 24) | (MPMIN(r, 255u) << 16) |
-                              (MPMIN(g, 255u) << 8) | MPMIN(b, 255u);
-            }
-        }
-    }
-    return visible;
-}
-
 static void clear_osd(struct priv *p)
 {
     if (!p->osd_empty) {
-        [p->mac setOsd:NULL];
+        [p->mac setOsdParts:NULL surfaceCount:0 descs:NULL partCount:0];
         p->osd_empty = true;
     }
 }
 
-// IOSurface-backed BGRA buffers: CoreAnimation maps them zero-copy, so even
-// per-tick OSC updates never cost the main thread a full-window image copy
-static bool ensure_osd_buffers(struct priv *p, int W, int H)
+// upload one item's packed BGRA atlas into its back-buffer IOSurface;
+// returns the buffer to display, or NULL on failure
+static CVPixelBufferRef upload_osd_item(struct priv *p, struct sub_bitmaps *imgs)
 {
-    if (p->osd_pb[0] && p->osd_pb_w == W && p->osd_pb_h == H)
-        return true;
-    for (int i = 0; i < 2; i++) {
-        if (p->osd_pb[i]) {
-            CVPixelBufferRelease(p->osd_pb[i]);
-            p->osd_pb[i] = NULL;
+    int slot = imgs->render_index;
+    if (slot < 0 || slot >= MAX_OSD_PARTS)
+        return NULL;
+    __typeof__(&p->osd_items[0]) it = &p->osd_items[slot];
+
+    int pw = imgs->packed_w, ph = imgs->packed_h;
+    bool resize = it->w != pw || it->h != ph;
+    if (!resize && it->pb[it->front] && it->change_id == imgs->change_id)
+        return it->pb[it->front];  // unchanged (e.g. static subtitles)
+
+    int back = it->front ^ 1;
+    if (resize || !it->pb[back]) {
+        if (resize) {
+            for (int i = 0; i < 2; i++) {
+                if (it->pb[i]) {
+                    CVPixelBufferRelease(it->pb[i]);
+                    it->pb[i] = NULL;
+                }
+            }
         }
+        NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+        if (CVPixelBufferCreate(kCFAllocatorDefault, pw, ph,
+                kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs,
+                &it->pb[back]) != kCVReturnSuccess) {
+            it->pb[back] = NULL;
+            return NULL;
+        }
+        it->w = pw;
+        it->h = ph;
     }
 
-    NSDictionary *attrs = @{
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-    };
-    for (int i = 0; i < 2; i++) {
-        if (CVPixelBufferCreate(kCFAllocatorDefault, W, H,
-                kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs,
-                &p->osd_pb[i]) != kCVReturnSuccess)
-            return false;
-        p->osd_pb_dirty[i][0] = 0;
-        p->osd_pb_dirty[i][1] = H;  // fresh memory: clear everything once
-    }
-    p->osd_pb_w = W;
-    p->osd_pb_h = H;
-    return true;
+    CVPixelBufferRef pb = it->pb[back];
+    CVPixelBufferLockBaseAddress(pb, 0);
+    uint8_t *dst = CVPixelBufferGetBaseAddress(pb);
+    size_t dst_stride = CVPixelBufferGetBytesPerRow(pb);
+    const uint8_t *src = imgs->packed->planes[0];
+    size_t src_stride = imgs->packed->stride[0];
+    for (int y = 0; y < ph; y++)
+        memcpy(dst + y * dst_stride, src + y * src_stride, (size_t)pw * 4);
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+
+    it->front = back;
+    it->change_id = imgs->change_id;
+    return pb;
 }
 
 static void update_osd(struct vo *vo)
 {
     struct priv *p = vo->priv;
 
-    // scripted OSCs animate every tick; rendering+packing a 4K ASS overlay
-    // per video frame costs a full core, so cap OSD updates at 30 Hz
+    // cap the core-side ASS rasterization/packing rate; layer updates
+    // themselves are cheap (GPU-composited)
     int64_t now = mp_time_ns();
-    if (now - p->osd_last_ns < MP_TIME_MS_TO_NS(33))
+    if (now - p->osd_last_ns < MP_TIME_MS_TO_NS(16))
         return;
     p->osd_last_ns = now;
 
@@ -215,59 +192,47 @@ static void update_osd(struct vo *vo)
     p->osd_change_id = list->change_id;
     p->osd_res = res;
 
-    // row range covered by the current parts (for the next reuse's clear)
-    int cur_y0 = H, cur_y1 = 0, num_parts = 0;
+    // upload each item's atlas (skipped when unchanged) and describe every
+    // part as {surface, src rect, dest rect} for GPU-composited CALayers
+    void *surfaces[MAX_OSD_PARTS] = {0};
+    int32_t descs[OSD_MAX_LAYERS * 9];
+    int ns = 0, np = 0;
+
     for (int i = 0; i < list->num_items; i++) {
         struct sub_bitmaps *imgs = list->items[i];
-        for (int j = 0; j < imgs->num_parts; j++) {
+        if (!imgs->num_parts || !imgs->packed)
+            continue;
+        CVPixelBufferRef pb = upload_osd_item(p, imgs);
+        if (!pb)
+            continue;
+        IOSurfaceRef surf = CVPixelBufferGetIOSurface(pb);
+        if (!surf)
+            continue;
+        surfaces[ns] = surf;
+
+        for (int j = 0; j < imgs->num_parts && np < OSD_MAX_LAYERS; j++) {
             struct sub_bitmap *sb = &imgs->parts[j];
-            int dh = sb->dh ? sb->dh : sb->h;
-            cur_y0 = MPMIN(cur_y0, MPMAX(sb->y, 0));
-            cur_y1 = MPMAX(cur_y1, MPMIN(sb->y + dh, H));
-            num_parts++;
+            int32_t *d = &descs[np * 9];
+            d[0] = ns;
+            d[1] = sb->src_x;
+            d[2] = sb->src_y;
+            d[3] = sb->w;
+            d[4] = sb->h;
+            d[5] = sb->x;
+            d[6] = sb->y;
+            d[7] = sb->dw ? sb->dw : sb->w;
+            d[8] = sb->dh ? sb->dh : sb->h;
+            np++;
         }
+        ns++;
     }
-    if (!num_parts || cur_y1 <= cur_y0) {
+
+    if (!np) {
         clear_osd(p);
         goto done;
     }
 
-    if (!ensure_osd_buffers(p, W, H)) {
-        clear_osd(p);
-        goto done;
-    }
-
-    int idx = p->osd_pb_idx ^= 1;
-    CVPixelBufferRef pb = p->osd_pb[idx];
-
-    CVPixelBufferLockBaseAddress(pb, 0);
-    uint32_t *buf = CVPixelBufferGetBaseAddress(pb);
-    size_t bpr = CVPixelBufferGetBytesPerRow(pb);
-    int stride32 = bpr / 4;
-
-    // clear only the rows this buffer dirtied last time it was displayed
-    int c0 = p->osd_pb_dirty[idx][0], c1 = p->osd_pb_dirty[idx][1];
-    if (c1 > c0)
-        memset((uint8_t *)buf + (size_t)c0 * bpr, 0, (size_t)(c1 - c0) * bpr);
-
-    bool visible = false;
-    for (int i = 0; i < list->num_items; i++) {
-        struct sub_bitmaps *imgs = list->items[i];
-        for (int j = 0; j < imgs->num_parts; j++)
-            visible |= blend_part(buf, 0, 0, stride32, H, &imgs->parts[j]);
-    }
-    p->osd_pb_dirty[idx][0] = cur_y0;
-    p->osd_pb_dirty[idx][1] = cur_y1;
-    CVPixelBufferUnlockBaseAddress(pb, 0);
-
-    // e.g. a faded-out OSC still submits fully transparent bitmaps every tick
-    if (!visible) {
-        clear_osd(p);
-        goto done;
-    }
-
-    CVPixelBufferRetain(pb);
-    [p->mac setOsd:(void *)pb];  // transfers the +1 retain
+    [p->mac setOsdParts:surfaces surfaceCount:ns descs:descs partCount:np];
     p->osd_empty = false;
 
 done:
@@ -426,9 +391,11 @@ static void uninit(struct vo *vo)
     mp_image_unrefp(&p->next_image);
     if (p->format_desc)
         CFRelease(p->format_desc);
-    for (int i = 0; i < 2; i++) {
-        if (p->osd_pb[i])
-            CVPixelBufferRelease(p->osd_pb[i]);
+    for (int i = 0; i < MAX_OSD_PARTS; i++) {
+        for (int j = 0; j < 2; j++) {
+            if (p->osd_items[i].pb[j])
+                CVPixelBufferRelease(p->osd_items[i].pb[j]);
+        }
     }
 
     hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
