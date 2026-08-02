@@ -41,6 +41,12 @@ clean rebases):
 - **EDR pre-warm**: a 1×1 `CAMetalLayer` with `wantsExtendedDynamicRangeContent`
   is added on HDR reconfig so the display's EDR transition happens under the
   black window, not over the first frames.
+- **Native CRT shader**: `video/out/mac/avf_crt.m` is a Metal compute-kernel
+  port of `crt-lottes.glsl` (YCbCr→RGB + scanlines + aperture-grille mask +
+  bloom at window resolution). It engages automatically when the
+  `glsl-shaders` list contains "crt-lottes" (the `Meta+c` toggle) on SDR
+  content — no VO switch. Other GLSL shaders still trigger the
+  `[shader-active]` profile → `gpu-next` (its condition excludes crt-lottes).
 - Window/input reuse mpv's Swift `Common` infra (`AVFCommon` subclass); the OSD
   layer tree is: plain root container → video layer + OSD part layers as
   siblings (OSD inside the EDR video layer forces CPU sRGB→PQ conversion —
