@@ -43,10 +43,12 @@ clean rebases):
   black window, not over the first frames.
 - **Native CRT shader**: `video/out/mac/avf_crt.m` is a Metal compute-kernel
   port of `crt-lottes.glsl` (YCbCr→RGB + scanlines + aperture-grille mask +
-  bloom at window resolution). It engages automatically when the
-  `glsl-shaders` list contains "crt-lottes" (the `Meta+c` toggle) on SDR
-  content — no VO switch. Other GLSL shaders still trigger the
-  `[shader-active]` profile → `gpu-next` (its condition excludes crt-lottes).
+  bloom at window resolution, aspect-fitted with black bars in-kernel). It
+  engages automatically when the `glsl-shaders` list contains "crt-lottes"
+  (the `Meta+c` toggle) — no VO switch. HDR PQ input is tone-mapped in the
+  kernel (PQ→linear, reinhard clip, 2020→709); HLG stays native without the
+  effect. Other GLSL shaders still trigger the `[shader-active]` profile →
+  `gpu-next` (its condition excludes crt-lottes).
 - Window/input reuse mpv's Swift `Common` infra (`AVFCommon` subclass); the OSD
   layer tree is: plain root container → video layer + OSD part layers as
   siblings (OSD inside the EDR video layer forces CPU sRGB→PQ conversion —
