@@ -29,11 +29,14 @@
 #include <libavutil/hwcontext.h>
 
 #include "common/common.h"
+#include "options/m_config.h"
 #include "osdep/mac/swift.h"
 #include "osdep/timer.h"
 #include "sub/osd.h"
 #include "video/hwdec.h"
 #include "video/mp_image.h"
+#include "video/out/gpu/video.h"
+#include "video/out/mac/avf_crt.h"
 #include "vo.h"
 
 struct priv {
@@ -54,6 +57,13 @@ struct priv {
     CVPixelBufferPoolRef upload_pool;
     int upload_w, upload_h;
     OSType upload_fmt;
+
+    // native Metal crt-lottes: engaged when the glsl-shaders list contains
+    // it (e.g. the Meta+c toggle), so the effect works without leaving
+    // the scanout path; SDR only
+    struct m_config_cache *gl_opts;
+    struct avf_crt *crt;
+    bool crt_failed;
     // per-item double-buffered IOSurface atlases; parts are GPU-composited
     // CALayers cropping into these via contentsRect
     struct {
@@ -340,6 +350,8 @@ static int preinit(struct vo *vo)
     }
 
     hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
+
+    p->gl_opts = m_config_cache_alloc(vo, vo->global, &gl_video_conf);
     return 0;
 }
 
@@ -405,7 +417,43 @@ static void flip_page(struct vo *vo)
     if (!pixbuf)
         goto done;
 
-    set_color_attachments(vo, pixbuf);
+    // apply the native CRT effect when crt-lottes is in the shader list
+    bool crt_active = false;
+    m_config_cache_update(p->gl_opts);
+    struct gl_video_opts *go = p->gl_opts->opts;
+    bool want_crt = false;
+    for (char **s = go->user_shaders; s && *s; s++) {
+        if (strstr(*s, "crt-lottes")) {
+            want_crt = true;
+            break;
+        }
+    }
+    bool is_hdr = vo->params && (vo->params->color.transfer == PL_COLOR_TRC_PQ ||
+                                 vo->params->color.transfer == PL_COLOR_TRC_HLG);
+    if (want_crt && !is_hdr) {
+        if (!p->crt && !p->crt_failed) {
+            p->crt = avf_crt_create(vo->log);
+            if (!p->crt)
+                p->crt_failed = true;
+        }
+        if (p->crt) {
+            CGSize wsz = [p->mac window].framePixel.size;
+            CVPixelBufferRef out = avf_crt_process(p->crt, pixbuf,
+                                                   wsz.width, wsz.height,
+                                                   vo->params);
+            if (out) {
+                if (owned)
+                    CVPixelBufferRelease(pixbuf);
+                pixbuf = out;
+                owned = true;
+                crt_active = true;
+            }
+        }
+    }
+
+    // CRT output is plain BGRA/sRGB; tagging video colorimetry would be wrong
+    if (!crt_active)
+        set_color_attachments(vo, pixbuf);
 
     if (!p->format_desc ||
         !CMVideoFormatDescriptionMatchesImageBuffer(p->format_desc, pixbuf))
@@ -484,6 +532,7 @@ static void uninit(struct vo *vo)
     }
     if (p->upload_pool)
         CVPixelBufferPoolRelease(p->upload_pool);
+    avf_crt_destroy(&p->crt);
 
     hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
     av_buffer_unref(&p->hwctx.av_device_ref);

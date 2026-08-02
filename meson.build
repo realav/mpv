@@ -1678,7 +1678,9 @@ if features['cocoa'] and features['vulkan'] and features['swift']
 endif
 if features['cocoa'] and features['swift'] and features['avfoundation']
     swift_sources += files('video/out/mac/avf_common.swift')
-    sources += files('video/out/vo_avfoundation.m')
+    sources += files('video/out/vo_avfoundation.m',
+                     'video/out/mac/avf_crt.m')
+    dependencies += dependency('appleframeworks', modules: ['Metal'])
 endif
 
 macos_media_player = get_option('macos-media-player').require(
